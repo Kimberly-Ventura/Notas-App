@@ -109,6 +109,7 @@ export default function DashboardScreen() {
 
   const recordingRef = React.useRef<Audio.Recording | null>(null);
   const isRotating = React.useRef(false);
+  const isStarting = React.useRef(false);
 
   const startRecording = async () => {
     try {
@@ -129,49 +130,68 @@ export default function DashboardScreen() {
   };
 
   const startAudioRecording = async () => {
-    if (Platform.OS !== 'web') {
-      const permission = await Audio.requestPermissionsAsync();
-      if (permission.status !== 'granted') {
-        Alert.alert('Permission Denied', 'Please grant microphone access to record voice notes.');
-        return;
+    if (isStarting.current) return;
+    isStarting.current = true;
+
+    try {
+      // Aggressive cleanup of any existing recording
+      if (recordingRef.current) {
+        try {
+          await recordingRef.current.stopAndUnloadAsync();
+        } catch (e) {}
+        recordingRef.current = null;
+        setRecording(null);
       }
+      if (Platform.OS !== 'web') {
+        const permission = await Audio.requestPermissionsAsync();
+        if (permission.status !== 'granted') {
+          Alert.alert('Permission Denied', 'Please grant microphone access to record voice notes.');
+          return;
+        }
+      }
+
+      await Audio.setAudioModeAsync({
+        allowsRecordingIOS: true,
+        playsInSilentModeIOS: true,
+        shouldDuckAndroid: true,
+        playThroughEarpieceAndroid: false,
+        staysActiveInBackground: true,
+        // @ts-ignore
+        interruptionModeAndroid: 1,
+        // @ts-ignore
+        interruptionModeIOS: 1,
+      });
+
+      const recordingOptions = {
+        android: {
+          extension: '.m4a',
+          outputFormat: 2, // MPEG_4
+          audioEncoder: 3, // AAC
+          sampleRate: 44100,
+          numberOfChannels: 1,
+          bitRate: 128000,
+        },
+        ios: {
+          extension: '.m4a',
+          outputFormat: 'aac ', // MPEG4AAC
+          audioQuality: 96, // HIGH
+          sampleRate: 44100,
+          numberOfChannels: 1,
+          bitRate: 128000,
+        },
+      } as any;
+
+      const { recording } = await Audio.Recording.createAsync(recordingOptions as any);
+      recordingRef.current = recording;
+      setRecording(recording);
+      setIsRecording(true);
+    } catch (error: any) {
+      console.error('Failed to start recording', error);
+      Alert.alert('Recording Error', error.message || 'Could not start recording.');
+      setIsRecording(false);
+    } finally {
+      isStarting.current = false;
     }
-
-    await Audio.setAudioModeAsync({
-      allowsRecordingIOS: true,
-      playsInSilentModeIOS: true,
-      shouldDuckAndroid: true,
-      playThroughEarpieceAndroid: false,
-      staysActiveInBackground: true,
-      // @ts-ignore
-      interruptionModeAndroid: 1,
-      // @ts-ignore
-      interruptionModeIOS: 1,
-    });
-
-    const recordingOptions = {
-      android: {
-        extension: '.m4a',
-        outputFormat: 2, // MPEG_4
-        audioEncoder: 3, // AAC
-        sampleRate: 44100,
-        numberOfChannels: 1,
-        bitRate: 128000,
-      },
-      ios: {
-        extension: '.m4a',
-        outputFormat: 'aac ', // MPEG4AAC
-        audioQuality: 96, // HIGH
-        sampleRate: 44100,
-        numberOfChannels: 1,
-        bitRate: 128000,
-      },
-    } as any;
-
-    const { recording } = await Audio.Recording.createAsync(recordingOptions as any);
-    recordingRef.current = recording;
-    setRecording(recording);
-    setIsRecording(true);
   };
 
   // Pulse/Chunked recording for Mobile "near real-time"

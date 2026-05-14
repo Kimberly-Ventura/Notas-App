@@ -233,9 +233,21 @@ export default function NoteViewScreen() {
 
   const recordingRef = React.useRef<Audio.Recording | null>(null);
   const isRotating = React.useRef(false);
+  const isStarting = React.useRef(false);
 
   const startRecording = async () => {
+    if (isStarting.current) return;
+    isStarting.current = true;
+
     try {
+      // Aggressive cleanup
+      if (recordingRef.current) {
+        try {
+          await recordingRef.current.stopAndUnloadAsync();
+        } catch (e) {}
+        recordingRef.current = null;
+        setRecording(null);
+      }
       if (Platform.OS === 'web' && recognition) {
         recognition.start();
         setIsRecording(true);
@@ -245,6 +257,8 @@ export default function NoteViewScreen() {
     } catch (err: any) {
       console.error('Failed to start recording', err);
       Alert.alert('Recording Error', err.message || 'Check microphone permissions');
+    } finally {
+      isStarting.current = false;
     }
   };
 
