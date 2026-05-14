@@ -1,6 +1,6 @@
 import { Feather, MaterialCommunityIcons } from '@expo/vector-icons';
 import { Audio } from 'expo-av';
-import * as FileSystem from 'expo-file-system';
+import * as FileSystem from 'expo-file-system/legacy';
 import { router } from 'expo-router';
 import React, { useState, useCallback } from 'react';
 import { useFocusEffect } from '@react-navigation/native';
@@ -33,6 +33,49 @@ export default function DashboardScreen() {
   const [recording, setRecording] = useState<Audio.Recording | null>(null);
   const [isRecording, setIsRecording] = useState(false);
   const [isTranscribing, setIsTranscribing] = useState(false);
+  const [recognition, setRecognition] = useState<any>(null);
+
+  // Initialize Web Speech API on Web
+  React.useEffect(() => {
+    if (Platform.OS === 'web' && (window.hasOwnProperty('SpeechRecognition') || window.hasOwnProperty('webkitSpeechRecognition'))) {
+      // @ts-ignore
+      const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+      const rec = new SpeechRecognition();
+      rec.continuous = true;
+      rec.interimResults = true;
+
+      rec.onresult = (event: any) => {
+        let interimTranscript = '';
+        let finalTranscript = '';
+
+        for (let i = event.resultIndex; i < event.results.length; ++i) {
+          if (event.results[i].isFinal) {
+            finalTranscript += event.results[i][0].transcript;
+          } else {
+            interimTranscript += event.results[i][0].transcript;
+          }
+        }
+
+        if (finalTranscript) {
+          setSubject((prev) => {
+            const trimmedPrev = prev.trim();
+            const newText = finalTranscript.trim();
+            if (trimmedPrev.endsWith(newText)) return prev; // Avoid duplicates
+            return trimmedPrev ? trimmedPrev + ' ' + newText : newText;
+          });
+        }
+      };
+
+      rec.onerror = (event: any) => {
+        console.error('Speech recognition error:', event.error);
+        if (event.error !== 'no-speech') {
+          setIsRecording(false);
+        }
+      };
+
+      setRecognition(rec);
+    }
+  }, []);
 
   useFocusEffect(
     useCallback(() => {
@@ -64,46 +107,154 @@ export default function DashboardScreen() {
     }
   };
 
+  const recordingRef = React.useRef<Audio.Recording | null>(null);
+  const isRotating = React.useRef(false);
+
   const startRecording = async () => {
     try {
-      if (Platform.OS !== 'web') {
-        const permission = await Audio.requestPermissionsAsync();
-        if (permission.status !== 'granted') {
-          Alert.alert('Permission Denied', 'Please grant microphone access to record voice notes.');
-          return;
+      if (Platform.OS === 'web') {
+        if (recognition) {
+          recognition.start();
+          setIsRecording(true);
+        } else {
+          await startAudioRecording();
         }
+      } else {
+        await startAudioRecording();
       }
-
-      await Audio.setAudioModeAsync({
-        allowsRecordingIOS: true,
-        playsInSilentModeIOS: true,
-      });
-
-      const { recording } = await Audio.Recording.createAsync(Audio.RecordingOptionsPresets.HIGH_QUALITY);
-      setRecording(recording);
-      setIsRecording(true);
     } catch (err) {
       console.error('Failed to start recording', err);
       Alert.alert('Error', 'Failed to start recording');
     }
   };
 
+  const startAudioRecording = async () => {
+    if (Platform.OS !== 'web') {
+      const permission = await Audio.requestPermissionsAsync();
+      if (permission.status !== 'granted') {
+        Alert.alert('Permission Denied', 'Please grant microphone access to record voice notes.');
+        return;
+      }
+    }
+
+    await Audio.setAudioModeAsync({
+      allowsRecordingIOS: true,
+      playsInSilentModeIOS: true,
+      shouldDuckAndroid: true,
+      playThroughEarpieceAndroid: false,
+      staysActiveInBackground: true,
+      // @ts-ignore
+      interruptionModeAndroid: 1,
+      // @ts-ignore
+      interruptionModeIOS: 1,
+    });
+
+    const recordingOptions = {
+      android: {
+        extension: '.m4a',
+        outputFormat: 2, // MPEG_4
+        audioEncoder: 3, // AAC
+        sampleRate: 44100,
+        numberOfChannels: 1,
+        bitRate: 128000,
+      },
+      ios: {
+        extension: '.m4a',
+        outputFormat: 'aac ', // MPEG4AAC
+        audioQuality: 96, // HIGH
+        sampleRate: 44100,
+        numberOfChannels: 1,
+        bitRate: 128000,
+      },
+    } as any;
+
+    const { recording } = await Audio.Recording.createAsync(recordingOptions as any);
+    recordingRef.current = recording;
+    setRecording(recording);
+    setIsRecording(true);
+  };
+
+  // Pulse/Chunked recording for Mobile "near real-time"
+  React.useEffect(() => {
+    let interval: any;
+    if (isRecording && Platform.OS !== 'web') {
+      interval = setInterval(async () => {
+        if (isRotating.current || !isRecording) return;
+        isRotating.current = true;
+        
+        const oldRecording = recordingRef.current;
+        if (!oldRecording) {
+          isRotating.current = false;
+          return;
+        }
+
+        try {
+          // Stop and transcribe old first to free up the recorder
+          await oldRecording.stopAndUnloadAsync();
+          
+          // Wait a tiny bit for native resources to free up
+          await new Promise(resolve => setTimeout(resolve, 300));
+
+          // Check again if we should still be recording
+          // This is critical to avoid starting a new one after user pressed stop
+          if (!isRecording) {
+            isRotating.current = false;
+            return;
+          }
+
+          const uri = oldRecording.getURI();
+          if (uri) transcribeAudio(uri);
+
+          const { recording: newRecording } = await Audio.Recording.createAsync({
+            android: { extension: '.m4a', outputFormat: 2, audioEncoder: 3, sampleRate: 44100, numberOfChannels: 1, bitRate: 128000 },
+            ios: { extension: '.m4a', outputFormat: 'aac ', audioQuality: 96, sampleRate: 44100, numberOfChannels: 1, bitRate: 128000 },
+          } as any);
+          
+          // Double check if user stopped while we were creating
+          if (!isRecording) {
+            await newRecording.stopAndUnloadAsync();
+            isRotating.current = false;
+            return;
+          }
+
+          recordingRef.current = newRecording;
+          setRecording(newRecording);
+        } catch (e) {
+          console.error('Pulse error:', e);
+        } finally {
+          isRotating.current = false;
+        }
+      }, 4000); // Pulse every 4 seconds for better real-time feel
+    }
+    return () => {
+      if (interval) clearInterval(interval);
+    };
+  }, [isRecording]);
+
   const stopRecording = async () => {
     setIsRecording(false);
-    if (!recording) return;
+
+    if (Platform.OS === 'web' && recognition) {
+      try { recognition.stop(); } catch (e) {}
+      return;
+    }
+
+    const finalRecording = recordingRef.current;
+    recordingRef.current = null;
+    setRecording(null);
+
+    if (!finalRecording) return;
 
     try {
       setIsTranscribing(true);
-      await recording.stopAndUnloadAsync();
-      const uri = recording.getURI();
-      setRecording(null);
-
+      await finalRecording.stopAndUnloadAsync();
+      const uri = finalRecording.getURI();
       if (uri) {
         await transcribeAudio(uri);
       }
     } catch (error) {
       console.error('Failed to stop recording', error);
-      Alert.alert('Error', 'Failed to stop recording');
+    } finally {
       setIsTranscribing(false);
     }
   };
@@ -127,7 +278,7 @@ export default function DashboardScreen() {
         formData.append('file', audioBlob, 'audio.m4a');
         formData.append('model', 'whisper-large-v3-turbo');
         formData.append('response_format', 'json');
-        formData.append('language', 'en');
+        // Removed language: 'en' to allow auto-detection
 
         const response = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
           method: 'POST',
@@ -156,13 +307,11 @@ export default function DashboardScreen() {
           uri,
           {
             httpMethod: 'POST',
-            uploadType: 1 as any, // FileSystemUploadType.MULTIPART
+            uploadType: 1 as any, // MULTIPART
             fieldName: 'file',
-            mimeType: 'audio/m4a',
             parameters: {
               model: 'whisper-large-v3-turbo',
-              response_format: 'json',
-              language: 'en',
+              response_format: 'json'
             },
             headers: {
               Authorization: `Bearer ${apiKey}`,
@@ -170,16 +319,18 @@ export default function DashboardScreen() {
           }
         );
 
-        const result = JSON.parse(response.body);
-
         if (response.status !== 200) {
-          throw new Error(result.error?.message || 'Transcription failed');
+          const errorData = JSON.parse(response.body);
+          console.error('Groq API Error:', errorData);
+          throw new Error(errorData.error?.message || `Transcription failed (${response.status})`);
         }
 
-        if (result.text) {
+        const result = JSON.parse(response.body);
+        if (result.text && result.text.trim()) {
           setSubject((prev) => {
             const trimmedPrev = prev.trim();
-            return trimmedPrev ? trimmedPrev + ' ' + result.text.trim() : result.text.trim();
+            const newText = result.text.trim();
+            return trimmedPrev ? trimmedPrev + ' ' + newText : newText;
           });
         }
       }
